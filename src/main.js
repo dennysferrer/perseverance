@@ -5,6 +5,8 @@ import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js'
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { mergeVertices, toCreasedNormals } from 'three/addons/utils/BufferGeometryUtils.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 
 // Icosaedro indexado (vértices compartidos) para normales suaves
 const smoothIco = (detail) => {
@@ -29,6 +31,7 @@ document.body.appendChild(renderer.domElement);
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.1, 5000);
 const CAM = { x: 0, z: 60, eye: 2.6 };
+const ROVER_START = { x: CAM.x, z: CAM.z - 14 };
 
 // ============================================================
 // Ruido
@@ -215,8 +218,10 @@ function makeRippleNormalMap(size = 512) {
 // ============================================================
 // Malla del terreno (más densa cerca de la cámara)
 // ============================================================
+const GRID = { SEG: 420, EXT: 2000, EXP: 1.7 };
+let groundPos;
 {
-  const SEG = 420, EXT = 2000, EXP = 1.7;
+  const { SEG, EXT, EXP } = GRID;
   const geo = new THREE.PlaneGeometry(2, 2, SEG, SEG);
   geo.rotateX(-Math.PI / 2);
   const pos = geo.attributes.position;
@@ -251,6 +256,7 @@ function makeRippleNormalMap(size = 512) {
     }),
   );
   ground.receiveShadow = true;
+  groundPos = geo.attributes.position;
   ground.castShadow = true;
   scene.add(ground);
 }
@@ -315,19 +321,35 @@ const rockMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 
 const rand = (() => { let s = 12345; return () => ((s = (s * 16807) % 2147483647) / 2147483647); })();
 const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), eu = new THREE.Euler(), sc = new THREE.Vector3(), pv = new THREE.Vector3();
 
+const boulders = []; // rocas grandes con las que choca el rover
+const ROCK_CELL = 2;
+const rockGrid = new Map(); // rocas pequeñas que las ruedas pueden pisar
+const addClimbable = (x, z, r, top) => {
+  const key = Math.floor(x / ROCK_CELL) * 100003 + Math.floor(z / ROCK_CELL);
+  if (!rockGrid.has(key)) rockGrid.set(key, []);
+  rockGrid.get(key).push({ x, z, r, r2: r * r, top });
+};
+const CLIMB_MAX = 0.42; // m: una rueda de 52,5 cm sobrepasa rocas de hasta ~40 cm
 function scatter(geo, count, { rMin, rMax, sizeMin, sizeMax, sizePow, cast, farProb }) {
   const mesh = new THREE.InstancedMesh(geo, rockMat, count);
+  geo.computeBoundingBox();
+  const bb = geo.boundingBox;
   let n = 0;
   while (n < count) {
     const r = rMin + Math.pow(rand(), 1.5) * (rMax - rMin);
     const a = rand() * Math.PI * 2; // 360°: rocas alrededor de toda la cámara
     const x = CAM.x + Math.sin(a) * r, z = CAM.z - Math.cos(a) * r;
+    if (Math.hypot(x - ROVER_START.x, z - ROVER_START.z) < 7) continue; // despejar la salida del rover
     const tr = terrain(x, z);
     if (rand() < tr.mask * tr.crest * farProb) continue; // no sobre la arena suelta de las dunas
     const s = sizeMin + Math.pow(rand(), sizePow) * (sizeMax - sizeMin);
     sc.set(s * (0.8 + rand() * 0.6), s * (0.6 + rand() * 0.6), s * (0.8 + rand() * 0.6));
     q.setFromEuler(eu.set((rand() - 0.5) * 0.5, rand() * Math.PI * 2, (rand() - 0.5) * 0.5));
     pv.set(x, tr.h - sc.y * 0.2, z);
+    const top = tr.h - groundHeight(x, z) + sc.y * (bb.max.y - 0.2);
+    const rad = 0.5 * (sc.x * (bb.max.x - bb.min.x) + sc.z * (bb.max.z - bb.min.z)) / 2;
+    if (top > CLIMB_MAX) boulders.push({ x, z, r: Math.max(sc.x, sc.z) * 0.75 });
+    else if (top > 0.02) addClimbable(x, z, rad, top);
     mesh.setMatrixAt(n++, m4.compose(pv, q, sc));
   }
   mesh.castShadow = cast;
@@ -436,19 +458,360 @@ const grade = new ShaderPass({
 composer.addPass(grade);
 
 // ============================================================
-// Controles: arrastrar = mirar 360°, clic derecho / rueda / WASD = caminar
+// Altura exacta de la malla renderizada (para apoyar rover y huellas)
+// ============================================================
+function groundHeight(x, z) {
+  const { SEG, EXT, EXP } = GRID;
+  const inv = (d) => Math.sign(d) * Math.pow(Math.min(1, Math.abs(d) / EXT), 1 / EXP);
+  const fu = ((inv(x - CAM.x) + 1) / 2) * SEG, fv = ((inv(z - CAM.z) + 1) / 2) * SEG;
+  const ix = Math.min(SEG - 1, Math.max(0, Math.floor(fu))), iy = Math.min(SEG - 1, Math.max(0, Math.floor(fv)));
+  const W = SEG + 1, P = groundPos;
+  const a = ix + W * iy, b = ix + W * (iy + 1), c = ix + 1 + W * (iy + 1), d = ix + 1 + W * iy;
+  const fx = (x - P.getX(a)) / (P.getX(d) - P.getX(a)), fz = (z - P.getZ(a)) / (P.getZ(b) - P.getZ(a));
+  const ha = P.getY(a), hb = P.getY(b), hc = P.getY(c), hd = P.getY(d);
+  return fx + fz <= 1 ? ha + (hd - ha) * fx + (hb - ha) * fz : hc + (hb - hc) * (1 - fx) + (hd - hc) * (1 - fz);
+}
+const groundNormal = (x, z, out, e = 0.35) =>
+  out.set(groundHeight(x - e, z) - groundHeight(x + e, z), 2 * e, groundHeight(x, z - e) - groundHeight(x, z + e)).normalize();
+
+// ============================================================
+// Rover Perseverance (modelo oficial NASA, tamaño real)
+// ============================================================
+const ROVER_HEIGHT = 2.2; // m (Perseverance: 3 m largo, 2.7 m ancho, 2.2 m alto)
+const WHEEL_DIAMETER = 0.525; // m
+const rover = {
+  pivot: new THREE.Group(),
+  x: ROVER_START.x, z: ROVER_START.z, heading: 0, speed: 0,
+  trackHalf: 1.05, wheelW: 0.42, halfBase: 1.25,
+  // ruedas por defecto (se reemplazan por las reales al cargar el modelo)
+  wheels: [-1, 1].flatMap((side) => [1.1, 0, -1.1].map((f) => ({ wrapper: null, x: side * 1.05, f, side, off: 0, spin: 0, contact: 0 }))),
+  susp: [], suspY: [0.3, 1],
+  cameras: {},
+};
+rover.pivot.position.set(rover.x, groundHeight(rover.x, rover.z), rover.z);
+scene.add(rover.pivot);
+
+const CAMERA_PARTS = {
+  Mastcam_Z_cams: 'Mastcam-Z: cámaras estéreo con zoom del mástil',
+  NavCams: 'Navcams: cámaras de navegación del mástil',
+  lens: 'lente del cabezal del mástil (probablemente SuperCam)',
+  hazcams_front: 'Hazcams delanteras: evitan obstáculos',
+  hazcams_rear: 'Hazcams traseras: evitan obstáculos',
+  Up_Look_Camera: 'Up-Look Camera: cámara del descenso (EDL) mirando arriba',
+  Down_Look_Camera: 'Down-Look Camera: cámara del descenso (EDL) mirando abajo',
+  WATSON: 'WATSON: cámara de primer plano en la torreta del brazo (SHERLOC)',
+};
+
+const envTex = (() => {
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  const envScene = new THREE.Scene();
+  envScene.add(new THREE.Mesh(new THREE.SphereGeometry(100, 32, 16), sky.material));
+  const t = pmrem.fromScene(envScene, 0.04).texture;
+  pmrem.dispose();
+  return t;
+})();
+
+const draco = new DRACOLoader().setDecoderPath('/draco/');
+new GLTFLoader().setDRACOLoader(draco).load(
+  '/models/perseverance.glb',
+  (gltf) => {
+    const model = gltf.scene;
+    model.rotation.y = Math.PI; // el frente del modelo mira a +Z; el rover avanza hacia -Z
+    const holder = new THREE.Group();
+    holder.add(model);
+    const measure = (obj) => { holder.updateMatrixWorld(true); return new THREE.Box3().setFromObject(obj, true); };
+    // escala real: por el diámetro de rueda (52,5 cm); si no hay ruedas, por la altura total (2,2 m)
+    const wheels = model.getObjectByName('Wheels_objs');
+    if (wheels) {
+      const wb = measure(wheels);
+      model.scale.setScalar(WHEEL_DIAMETER / (wb.max.y - wb.min.y));
+    } else {
+      const b = measure(model);
+      model.scale.setScalar(ROVER_HEIGHT / (b.max.y - b.min.y));
+    }
+    let box = measure(model);
+    const ctr = box.getCenter(new THREE.Vector3());
+    model.position.set(-ctr.x, -box.min.y, -ctr.z);
+    box = measure(model);
+    const size = box.getSize(new THREE.Vector3());
+    if (wheels) {
+      const wb = measure(wheels);
+      rover.trackHalf = (wb.max.x - wb.min.x) / 2 - rover.wheelW / 2;
+      rover.halfBase = (wb.max.z - wb.min.z) / 2 - WHEEL_DIAMETER / 2;
+    }
+
+    model.traverse((o) => {
+      if (o.isMesh) {
+        o.castShadow = true;
+        o.receiveShadow = true;
+        for (const m of [].concat(o.material)) {
+          if ('envMap' in m) { m.envMap = envTex; m.envMapIntensity = 0.7; m.needsUpdate = true; }
+        }
+      }
+    });
+
+    // piezas que son cámaras (las guardamos para usarlas más adelante)
+    model.traverse((o) => {
+      if (CAMERA_PARTS[o.name]) rover.cameras[o.name] = o;
+    });
+    window.roverCameras = rover.cameras;
+    console.log(`[rover] Perseverance cargado: ${size.z.toFixed(2)} m largo × ${size.x.toFixed(2)} m ancho × ${size.y.toFixed(2)} m alto`);
+    console.log(`[rover] Piezas que son cámaras (${Object.keys(rover.cameras).length}):`);
+    for (const name of Object.keys(rover.cameras)) console.log(`[rover]   ${name} — ${CAMERA_PARTS[name]}`);
+
+    setupRig(model, holder);
+    rover.pivot.add(holder);
+    window.__roverReady = true;
+  },
+  undefined,
+  (err) => console.error('[rover] No se pudo cargar el modelo:', err),
+);
+
+// ============================================================
+// Rocker-bogie: separa las 6 ruedas y deforma la suspensión
+// ============================================================
+function bakeToHolder(o, holder) {
+  const g = o.geometry.clone();
+  for (const name of Object.keys(g.attributes)) {
+    const a = g.attributes[name];
+    if (a.isInterleavedBufferAttribute || !(a.array instanceof Float32Array) || a.normalized) {
+      const get = [a.getX, a.getY, a.getZ, a.getW];
+      const arr = new Float32Array(a.count * a.itemSize);
+      for (let i = 0; i < a.count; i++) for (let c = 0; c < a.itemSize; c++) arr[i * a.itemSize + c] = get[c].call(a, i);
+      g.setAttribute(name, new THREE.BufferAttribute(arr, a.itemSize));
+    }
+  }
+  g.applyMatrix4(new THREE.Matrix4().copy(holder.matrixWorld).invert().multiply(o.matrixWorld));
+  return g;
+}
+
+function setupRig(model, holder) {
+  holder.updateMatrixWorld(true);
+  const R = WHEEL_DIAMETER / 2;
+  const wheelsObj = model.getObjectByName('Wheels_objs');
+  if (!wheelsObj) return;
+  const parts = [];
+  wheelsObj.traverse((o) => {
+    if (!o.isMesh || o.isSkinnedMesh) return;
+    let g = bakeToHolder(o, holder);
+    if (g.index) g = g.toNonIndexed();
+    parts.push({ g, mat: o.material });
+    o.visible = false;
+  });
+  // centroide de cada triángulo
+  for (const p of parts) {
+    const a = p.g.attributes.position.array, n = a.length / 9;
+    p.cent = new Float32Array(n * 2);
+    for (let t = 0; t < n; t++) {
+      const o = t * 9;
+      p.cent[t * 2] = (a[o] + a[o + 3] + a[o + 6]) / 3;
+      p.cent[t * 2 + 1] = (a[o + 2] + a[o + 5] + a[o + 8]) / 3;
+    }
+  }
+  // k-means 1D (3 ruedas por lado a lo largo del eje Z)
+  const centers = [];
+  for (const side of [-1, 1]) {
+    const zs = [];
+    for (const p of parts) for (let i = 0; i < p.cent.length; i += 2) if ((p.cent[i] < 0 ? -1 : 1) === side) zs.push(p.cent[i + 1]);
+    zs.sort((a, b) => a - b);
+    let c = [zs[0], (zs[0] + zs[zs.length - 1]) / 2, zs[zs.length - 1]];
+    for (let it = 0; it < 20; it++) {
+      const s = [0, 0, 0], n = [0, 0, 0];
+      for (const z of zs) {
+        let k = 0;
+        for (let j = 1; j < 3; j++) if (Math.abs(z - c[j]) < Math.abs(z - c[k])) k = j;
+        s[k] += z; n[k]++;
+      }
+      c = c.map((v, j) => (n[j] ? s[j] / n[j] : v));
+    }
+    for (const z of c) centers.push({ side, z });
+  }
+  const wheelTris = centers.map(() => parts.map(() => []));
+  parts.forEach((p, pi) => {
+    for (let t = 0; t < p.cent.length / 2; t++) {
+      const side = p.cent[t * 2] < 0 ? -1 : 1, z = p.cent[t * 2 + 1];
+      let best = -1, bd = Infinity;
+      centers.forEach((c, ci) => { if (c.side === side && Math.abs(z - c.z) < bd) { bd = Math.abs(z - c.z); best = ci; } });
+      wheelTris[best][pi].push(t);
+    }
+  });
+  rover.wheels = centers.map((c, ci) => {
+    const box = new THREE.Box3();
+    const geos = parts.map((p, pi) => {
+      const tris = wheelTris[ci][pi];
+      if (!tris.length) return null;
+      const g = new THREE.BufferGeometry();
+      for (const name of Object.keys(p.g.attributes)) {
+        const a = p.g.attributes[name], is = a.itemSize, arr = new Float32Array(tris.length * 3 * is);
+        let o = 0;
+        for (const t of tris) for (let k = 0; k < 3 * is; k++) arr[o++] = a.array[t * 3 * is + k];
+        g.setAttribute(name, new THREE.BufferAttribute(arr, is));
+      }
+      g.computeBoundingBox();
+      box.union(g.boundingBox);
+      return g;
+    });
+    // eje de la rueda: centro horizontal de la rueda, a un radio del suelo
+    const axle = new THREE.Vector3((box.min.x + box.max.x) / 2, box.min.y + R, (box.min.z + box.max.z) / 2);
+    const wrapper = new THREE.Group();
+    geos.forEach((g, pi) => {
+      if (!g) return;
+      g.translate(-axle.x, -axle.y, -axle.z);
+      const m = new THREE.Mesh(g, parts[pi].mat);
+      m.castShadow = m.receiveShadow = true;
+      wrapper.add(m);
+    });
+    wrapper.position.copy(axle);
+    holder.add(wrapper);
+    return { wrapper, base: axle.clone(), x: axle.x, f: -axle.z, side: c.side, off: 0, spin: 0, contact: 0 };
+  });
+  rover.trackHalf = rover.wheels.reduce((s, w) => s + Math.abs(w.x), 0) / rover.wheels.length;
+
+  // suspensión: se deforma siguiendo la altura de las ruedas de su lado
+  const susp = model.getObjectByName('suspension');
+  let yTop = 0;
+  if (susp) susp.traverse((o) => {
+    if (!o.isMesh || o.isSkinnedMesh) return;
+    const g = bakeToHolder(o, holder);
+    g.computeBoundingBox();
+    yTop = Math.max(yTop, g.boundingBox.max.y);
+    const m = new THREE.Mesh(g, o.material);
+    m.castShadow = m.receiveShadow = true;
+    m.frustumCulled = false;
+    holder.add(m);
+    o.visible = false;
+    rover.susp.push({ g, orig: g.attributes.position.array.slice() });
+  });
+  rover.suspY = [R + 0.08, yTop];
+}
+
+let lastSuspOff = '';
+function deformSuspension() {
+  if (!rover.susp.length) return;
+  const key = rover.wheels.map((w) => w.off.toFixed(3)).join();
+  if (key === lastSuspOff) return;
+  lastSuspOff = key;
+  const L = rover.wheels.filter((w) => w.side < 0).sort((a, b) => a.f - b.f);
+  const Rt = rover.wheels.filter((w) => w.side > 0).sort((a, b) => a.f - b.f);
+  const interp = (arr, f) => {
+    if (f <= arr[0].f) return arr[0].off;
+    for (let i = 1; i < arr.length; i++) {
+      if (f <= arr[i].f) return arr[i - 1].off + ((arr[i].off - arr[i - 1].off) * (f - arr[i - 1].f)) / (arr[i].f - arr[i - 1].f);
+    }
+    return arr[arr.length - 1].off;
+  };
+  const [y0, y1] = rover.suspY;
+  for (const s of rover.susp) {
+    const p = s.g.attributes.position.array, o = s.orig;
+    for (let i = 0; i < o.length; i += 3) {
+      const y = o[i + 1];
+      const w = 1 - THREE.MathUtils.smoothstep(y, y0, y1);
+      p[i + 1] = w > 0 ? y + interp(o[i] < 0 ? L : Rt, -o[i + 2]) * w : y;
+    }
+    s.g.attributes.position.needsUpdate = true;
+  }
+}
+
+// cuánto sube una rueda (radio R) al pisar rocas pequeñas: perfil elipsoidal de cada roca
+function rockLift(px, pz) {
+  const R = WHEEL_DIAMETER / 2;
+  const ci = Math.floor(px / ROCK_CELL), cj = Math.floor(pz / ROCK_CELL);
+  const cand = [];
+  for (let i = ci - 1; i <= ci + 1; i++) for (let j = cj - 1; j <= cj + 1; j++) {
+    const cell = rockGrid.get(i * 100003 + j);
+    if (cell) for (const r of cell) if (Math.hypot(r.x - px, r.z - pz) < r.r + R + 0.3) cand.push(r);
+  }
+  if (!cand.length) return 0;
+  let best = 0;
+  for (const a of [-0.9, -0.6, -0.3, 0, 0.3, 0.6, 0.9]) {
+    const drop = R - Math.sqrt(R * R - (a * R) ** 2);
+    for (const l of [-0.16, 0, 0.16]) {
+      const sx = px + fwd.x * a * R + right.x * l, sz = pz + fwd.z * a * R + right.z * l;
+      for (const r of cand) {
+        const d2 = (sx - r.x) ** 2 + (sz - r.z) ** 2;
+        if (d2 < r.r2) {
+          const h = r.top * Math.sqrt(1 - d2 / r.r2) - drop;
+          if (h > best) best = h;
+        }
+      }
+    }
+  }
+  return best;
+}
+
+// ============================================================
+// Huellas de las ruedas (decals sobre el terreno)
+// ============================================================
+const treadTex = (() => {
+  const cv = document.createElement('canvas');
+  cv.width = 64; cv.height = 128;
+  const g = cv.getContext('2d');
+  g.fillStyle = 'rgba(70,28,14,0.55)';
+  g.fillRect(0, 0, 64, 128);
+  for (let y = 0; y < 128; y += 16) {
+    g.fillStyle = 'rgba(40,14,6,0.8)';
+    g.beginPath(); // grousers en "V" suave como las ruedas de Perseverance
+    g.moveTo(0, y + 2); g.lineTo(32, y + 7); g.lineTo(64, y + 2);
+    g.lineTo(64, y + 7); g.lineTo(32, y + 12); g.lineTo(0, y + 7);
+    g.fill();
+    g.fillStyle = 'rgba(255,190,140,0.18)';
+    g.fillRect(0, y + 12, 64, 2);
+  }
+  const fade = g.createLinearGradient(0, 0, 64, 0);
+  fade.addColorStop(0, 'rgba(0,0,0,1)'); fade.addColorStop(0.12, 'rgba(0,0,0,0)');
+  fade.addColorStop(0.88, 'rgba(0,0,0,0)'); fade.addColorStop(1, 'rgba(0,0,0,1)');
+  g.globalCompositeOperation = 'destination-out';
+  g.fillStyle = fade;
+  g.fillRect(0, 0, 64, 128);
+  const t = new THREE.CanvasTexture(cv);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  return t;
+})();
+const MAX_TRACKS = 9000;
+const trackGeo = new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2);
+const tracks = new THREE.InstancedMesh(
+  trackGeo,
+  new THREE.MeshStandardMaterial({
+    map: treadTex, transparent: true, depthWrite: false, roughness: 1,
+    polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -4,
+  }),
+  MAX_TRACKS,
+);
+tracks.count = 0;
+tracks.frustumCulled = false;
+tracks.receiveShadow = true;
+scene.add(tracks);
+let trackHead = 0;
+const lastTrack = { [-1]: null, [1]: null };
+const tA = new THREE.Vector3(), tB = new THREE.Vector3(), tF = new THREE.Vector3(), tU = new THREE.Vector3(), tR = new THREE.Vector3();
+const tM = new THREE.Matrix4();
+function addTrack(p0, p1) {
+  tA.set(p0.x, groundHeight(p0.x, p0.z), p0.z);
+  tB.set(p1.x, groundHeight(p1.x, p1.z), p1.z);
+  const len = tA.distanceTo(tB);
+  tF.subVectors(tB, tA).normalize();
+  groundNormal((p0.x + p1.x) / 2, (p0.z + p1.z) / 2, tU);
+  tR.crossVectors(tF, tU).normalize();
+  tU.crossVectors(tR, tF);
+  tM.makeBasis(tR, tU, tF.negate());
+  tM.scale(new THREE.Vector3(rover.wheelW, 1, len * 1.04));
+  tM.setPosition(tA.add(tB).multiplyScalar(0.5).addScaledVector(tU, 0.025));
+  tracks.setMatrixAt(trackHead, tM);
+  trackHead = (trackHead + 1) % MAX_TRACKS;
+  tracks.count = Math.min(MAX_TRACKS, tracks.count + 1);
+  tracks.instanceMatrix.needsUpdate = true;
+}
+
+// ============================================================
+// Controles: WASD conduce · arrastrar orbita 360° · rueda = zoom
 // ============================================================
 const el = renderer.domElement;
 el.style.cursor = 'grab';
 el.style.touchAction = 'none';
-camera.rotation.order = 'YXZ';
-const view = { yaw: 0.06, pitch: 0.06 };
-const player = { x: CAM.x, z: CAM.z, y: heightAt(CAM.x, CAM.z) + CAM.eye, bob: 0 };
-const vel = new THREE.Vector3(), wish = new THREE.Vector3();
-const fwd = new THREE.Vector3(), right = new THREE.Vector3();
+const orbit = { yaw: 0, elev: 0.17, dist: 10, lastDrag: -1e9 };
 const keys = new Set();
 const pointers = new Map();
-let walkHeld = false, wheel = 0;
 const hint = document.getElementById('hint');
 let hintTimer = setTimeout(() => hint?.classList.add('hide'), 12000);
 const hideHint = () => { clearTimeout(hintTimer); hintTimer = setTimeout(() => hint?.classList.add('hide'), 2500); };
@@ -457,8 +820,7 @@ el.addEventListener('contextmenu', (e) => e.preventDefault());
 el.addEventListener('pointerdown', (e) => {
   el.setPointerCapture(e.pointerId);
   pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
-  if (e.button === 2) walkHeld = true;
-  else el.style.cursor = 'grabbing';
+  el.style.cursor = 'grabbing';
   hideHint();
 });
 el.addEventListener('pointermove', (e) => {
@@ -466,22 +828,29 @@ el.addEventListener('pointermove', (e) => {
   if (!p) return;
   const dx = e.clientX - p.x, dy = e.clientY - p.y;
   p.x = e.clientX; p.y = e.clientY;
-  if (e.pointerType === 'mouse' && !(e.buttons & 1)) return; // solo el botón izquierdo gira
   if (pointers.size > 1) return;
-  view.yaw -= dx * 0.0035;
-  view.pitch = THREE.MathUtils.clamp(view.pitch - dy * 0.0035, -1.35, 1.35);
+  orbit.yaw -= dx * 0.0035;
+  orbit.elev = THREE.MathUtils.clamp(orbit.elev + dy * 0.003, 0.03, 1.35);
+  orbit.lastDrag = performance.now();
 });
 const endPointer = (e) => {
   pointers.delete(e.pointerId);
-  if (e.button === 2) walkHeld = false;
-  if (!pointers.size) { walkHeld = false; el.style.cursor = 'grab'; }
+  if (!pointers.size) el.style.cursor = 'grab';
 };
 el.addEventListener('pointerup', endPointer);
 el.addEventListener('pointercancel', endPointer);
-el.addEventListener('wheel', (e) => { e.preventDefault(); wheel += -e.deltaY * 0.03; hideHint(); }, { passive: false });
-addEventListener('keydown', (e) => { keys.add(e.code); hideHint(); });
+el.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  orbit.dist = THREE.MathUtils.clamp(orbit.dist * Math.exp(e.deltaY * 0.001), 4.5, 45);
+  hideHint();
+}, { passive: false });
+addEventListener('keydown', (e) => {
+  if (e.code.startsWith('Arrow')) e.preventDefault();
+  keys.add(e.code);
+  hideHint();
+});
 addEventListener('keyup', (e) => keys.delete(e.code));
-addEventListener('blur', () => { keys.clear(); walkHeld = false; });
+addEventListener('blur', () => keys.clear());
 
 // ============================================================
 // Bucle
@@ -494,40 +863,119 @@ addEventListener('resize', () => {
   grade.uniforms.res.value.set(innerWidth, innerHeight);
 });
 
-const WALK_RADIUS = 230;
+const DRIVE_RADIUS = 230;
+const fwd = new THREE.Vector3(), right = new THREE.Vector3();
+const rF = new THREE.Vector3(), rR = new THREE.Vector3(), rU = new THREE.Vector3(), rM = new THREE.Matrix4();
+const rQ = new THREE.Quaternion();
+const wp = new THREE.Vector3();
+const camTarget = new THREE.Vector3(rover.x, rover.pivot.position.y + 1.4, rover.z);
+const lookAt = new THREE.Vector3();
+const wrapAngle = (a) => Math.atan2(Math.sin(a), Math.cos(a));
 let last = performance.now();
-renderer.setAnimationLoop((ms) => {
-  const t = ms * 0.001;
-  const dt = Math.min(0.05, (ms - last) / 1000 || 0);
-  last = ms;
 
-  // movimiento en el plano según hacia dónde se mira
-  fwd.set(-Math.sin(view.yaw), 0, -Math.cos(view.yaw));
-  right.set(Math.cos(view.yaw), 0, -Math.sin(view.yaw));
+function update(dt, t) {
   const k = (c) => (keys.has(c) ? 1 : 0);
-  const f = k('KeyW') + k('ArrowUp') - k('KeyS') - k('ArrowDown') + (walkHeld || pointers.size > 1 ? 1 : 0);
-  const s = k('KeyD') + k('ArrowRight') - k('KeyA') - k('ArrowLeft');
-  wish.set(0, 0, 0).addScaledVector(fwd, f).addScaledVector(right, s);
-  if (wish.lengthSq() > 1) wish.normalize();
-  wish.multiplyScalar(keys.has('ShiftLeft') || keys.has('ShiftRight') ? 14 : 5);
-  vel.lerp(wish, 1 - Math.exp(-dt * 6));
-  player.x += (vel.x + fwd.x * wheel) * dt;
-  player.z += (vel.z + fwd.z * wheel) * dt;
-  wheel *= Math.exp(-dt * 3);
-  const ox = player.x - CAM.x, oz = player.z - CAM.z, r = Math.hypot(ox, oz);
-  if (r > WALK_RADIUS) { player.x = CAM.x + (ox / r) * WALK_RADIUS; player.z = CAM.z + (oz / r) * WALK_RADIUS; }
-  const speed = Math.hypot(vel.x + fwd.x * wheel, vel.z + fwd.z * wheel);
-  player.bob += speed * dt * 1.6;
-  const groundY = heightAt(player.x, player.z) + CAM.eye;
-  player.y += (groundY - player.y) * (1 - Math.exp(-dt * 10));
-  camera.position.set(player.x, player.y + Math.sin(player.bob * 2) * 0.04 * Math.min(1, speed / 5), player.z);
-  camera.rotation.set(view.pitch, view.yaw, 0);
+
+  // --- conducción ---
+  const throttle = k('KeyW') + k('ArrowUp') - k('KeyS') - k('ArrowDown');
+  const steer = k('KeyA') + k('ArrowLeft') - k('KeyD') - k('ArrowRight');
+  const vMax = keys.has('ShiftLeft') || keys.has('ShiftRight') ? 7 : 3;
+  const vTarget = throttle > 0 ? vMax : throttle < 0 ? -vMax * 0.6 : 0;
+  rover.speed += (vTarget - rover.speed) * (1 - Math.exp(-dt * (throttle ? 1.8 : 3.5)));
+  const yawRate = steer * 0.8 * (rover.speed < -0.05 ? -1 : 1); // puede girar sobre sí mismo
+  rover.heading += yawRate * dt;
+  fwd.set(-Math.sin(rover.heading), 0, -Math.cos(rover.heading));
+  right.set(Math.cos(rover.heading), 0, -Math.sin(rover.heading));
+  rover.x += fwd.x * rover.speed * dt;
+  rover.z += fwd.z * rover.speed * dt;
+  // choque con rocas grandes: el rover se detiene y se desliza por el borde
+  for (const b of boulders) {
+    const dx = rover.x - b.x, dz = rover.z - b.z, minD = b.r + 1.35;
+    const d2 = dx * dx + dz * dz;
+    if (d2 < minD * minD && d2 > 1e-6) {
+      const d = Math.sqrt(d2);
+      rover.x = b.x + (dx / d) * minD;
+      rover.z = b.z + (dz / d) * minD;
+      rover.speed *= 0.6;
+    }
+  }
+  const ox = rover.x - CAM.x, oz = rover.z - CAM.z, r = Math.hypot(ox, oz);
+  if (r > DRIVE_RADIUS) { rover.x = CAM.x + (ox / r) * DRIVE_RADIUS; rover.z = CAM.z + (oz / r) * DRIVE_RADIUS; rover.speed *= 0.5; }
+
+  // --- rocker-bogie: cada rueda apoya en terreno + rocas pequeñas; el chasis sigue el plano medio ---
+  const W = rover.trackHalf;
+  const wl = rover.wheels;
+  let sx = 0, sf = 0, sc = 0;
+  for (const w of wl) {
+    const px = rover.x + right.x * w.x + fwd.x * w.f, pz = rover.z + right.z * w.x + fwd.z * w.f;
+    w.contact = groundHeight(px, pz) + rockLift(px, pz);
+    sx += w.x; sf += w.f; sc += w.contact;
+  }
+  const mx = sx / wl.length, mf = sf / wl.length, mc = sc / wl.length;
+  let nX = 0, dX = 0, nF = 0, dF = 0;
+  for (const w of wl) {
+    nX += (w.x - mx) * (w.contact - mc); dX += (w.x - mx) ** 2;
+    nF += (w.f - mf) * (w.contact - mc); dF += (w.f - mf) ** 2;
+  }
+  const slopeX = nX / dX, slopeF = nF / dF;
+  const baseY = mc - slopeX * mx - slopeF * mf;
+  rF.copy(fwd); rF.y = slopeF; rF.normalize();
+  rR.copy(right); rR.y = slopeX; rR.normalize();
+  rU.crossVectors(rR, rF).normalize();
+  rR.crossVectors(rF, rU);
+  rM.makeBasis(rR, rU, rF.clone().negate());
+  rQ.setFromRotationMatrix(rM);
+  rover.pivot.quaternion.slerp(rQ, 1 - Math.exp(-dt * 8));
+  rover.pivot.position.set(rover.x, THREE.MathUtils.lerp(rover.pivot.position.y, baseY, 1 - Math.exp(-dt * 12)), rover.z);
+  rover.pivot.updateMatrixWorld();
+
+  // cada rueda sube/baja respecto al chasis real y gira según su velocidad (diferencial en curvas)
+  for (const w of wl) {
+    wp.set(w.x, 0, -w.f);
+    rover.pivot.localToWorld(wp);
+    const target = THREE.MathUtils.clamp(w.contact - wp.y, -0.25, 0.45);
+    w.off += (target - w.off) * (1 - Math.exp(-dt * 25));
+    w.spin += ((rover.speed + yawRate * w.x) * dt) / (WHEEL_DIAMETER / 2);
+    if (w.wrapper) {
+      w.wrapper.position.y = w.base.y + w.off;
+      w.wrapper.rotation.x = -w.spin;
+    }
+  }
+  deformSuspension();
+
+  // --- huellas: una por lado (las 3 ruedas de cada lado pisan la misma rodada) ---
+  for (const side of [-1, 1]) {
+    const p = { x: rover.x + right.x * W * side, z: rover.z + right.z * W * side };
+    const prev = lastTrack[side];
+    if (!prev) { lastTrack[side] = p; continue; }
+    const d = Math.hypot(p.x - prev.x, p.z - prev.z);
+    if (d > 4) lastTrack[side] = p;
+    else if (d >= 0.3) { addTrack(prev, p); lastTrack[side] = p; }
+  }
+
+  // --- cámara que sigue al rover (órbita libre con el ratón) ---
+  if (performance.now() - orbit.lastDrag > 1500 && Math.abs(rover.speed) > 0.2) {
+    orbit.yaw += wrapAngle(rover.heading - orbit.yaw) * (1 - Math.exp(-dt * 1.2));
+  }
+  camTarget.lerp(lookAt.set(rover.x, rover.pivot.position.y + 1.4, rover.z), 1 - Math.exp(-dt * 6));
+  const ce = Math.cos(orbit.elev);
+  camera.position.set(
+    camTarget.x + Math.sin(orbit.yaw) * ce * orbit.dist,
+    camTarget.y + Math.sin(orbit.elev) * orbit.dist,
+    camTarget.z + Math.cos(orbit.yaw) * ce * orbit.dist,
+  );
+  camera.position.y = Math.max(camera.position.y, groundHeight(camera.position.x, camera.position.z) + 0.5);
+  // con cámara baja mira más allá del rover hacia el horizonte; desde arriba, al rover
+  const far = 1 - THREE.MathUtils.smoothstep(orbit.elev, 0.25, 0.8);
+  lookAt.set(-Math.sin(orbit.yaw), 0, -Math.cos(orbit.yaw)).multiplyScalar(22 * far).add(camTarget);
+  lookAt.y += 2.6 * far;
+  camera.lookAt(lookAt);
 
   // cielo, sol y lunas viajan con la cámara (están "en el infinito")
   celestial.position.copy(camera.position);
 
-  // la caja de sombras sigue al jugador (ajustada a la rejilla para evitar parpadeo)
-  shadowTarget.set(Math.round((player.x + fwd.x * 90) / 4) * 4, 0, Math.round((player.z + fwd.z * 90) / 4) * 4);
+  // la caja de sombras sigue al rover (ajustada a una rejilla para evitar parpadeo)
+  shadowTarget.set(Math.round(rover.x / 4) * 4, 0, Math.round(rover.z / 4) * 4);
   sun.target.position.copy(shadowTarget);
   sun.position.copy(shadowTarget).addScaledVector(sunDir, 700);
 
@@ -535,12 +983,21 @@ renderer.setAnimationLoop((ms) => {
   const a = dustGeo.attributes.position;
   for (let i = 0; i < DUST; i++) {
     let x = a.getX(i) + 0.035, z = a.getZ(i);
-    if (x - player.x > 130) x -= 260; else if (x - player.x < -130) x += 260;
-    if (z - player.z > 130) z -= 260; else if (z - player.z < -130) z += 260;
+    if (x - rover.x > 130) x -= 260; else if (x - rover.x < -130) x += 260;
+    if (z - rover.z > 130) z -= 260; else if (z - rover.z < -130) z += 260;
     a.setXYZ(i, x, a.getY(i) + Math.sin(t * 0.6 + i) * 0.004, z);
   }
   a.needsUpdate = true;
 
   grade.uniforms.time.value = t;
+}
+renderer.setAnimationLoop((ms) => {
+  const dt = THREE.MathUtils.clamp((ms - last) / 1000 || 0, 0, 0.05);
+  last = ms;
+  update(dt, ms * 0.001);
   composer.render();
 });
+// gancho de pruebas: avanza la simulación sin depender de los FPS (lo usa npm run check)
+let simT = 0;
+window.__test = { rover, orbit, rockGrid, boulders };
+window.__sim = (frames, dt = 1 / 30) => { for (let i = 0; i < frames; i++) update(dt, (simT += dt)); };
