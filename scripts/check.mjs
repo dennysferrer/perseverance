@@ -79,10 +79,51 @@ if (!climb.error) {
   console.log(`[check] Suspensión: una rueda subió ${(maxLift * 100).toFixed(0)} cm sobre una roca de ${(climb.rock.top * 100).toFixed(0)} cm`);
   if (maxLift < 0.05) errors.push('[check] la rueda no subió al pisar la roca');
 } else errors.push(`[check] prueba de suspensión: ${climb.error}`);
+
+// Cámaras: cada punto brillante abre una foto real de Marte (requiere internet)
+await page.evaluate(() => {
+  const { rover, orbit } = window.__test;
+  rover.speed = 0;
+  Object.assign(orbit, { yaw: rover.heading + 0.6, elev: 0.9, dist: 7, lastDrag: performance.now() + 1e7 });
+  window.__sim(60);
+});
+await page.waitForTimeout(500);
+const camResults = [];
+for (const cam of ['Mastcam_Z_cams', 'NavCams', 'hazcams_front', 'WATSON']) {
+  const spot = page.locator(`.cam-spot[data-cam="${cam}"]`);
+  if (!(await spot.waitFor({ state: 'visible', timeout: 5000 }).then(() => true, () => false))) { errors.push(`[check] cámara ${cam}: el punto no se ve`); continue; }
+  // el punto late (animación) y la cámara aún se acomoda: espera a que su centro se quede quieto
+  let bb = await spot.boundingBox();
+  for (let i = 0; i < 20; i++) {
+    await page.waitForTimeout(250);
+    const nb = await spot.boundingBox();
+    const still = Math.hypot(nb.x + nb.width / 2 - bb.x - bb.width / 2, nb.y + nb.height / 2 - bb.y - bb.height / 2) < 1;
+    bb = nb;
+    if (still) break;
+  }
+  await page.mouse.move(bb.x + bb.width / 2, bb.y + bb.height / 2);
+  await page.waitForTimeout(200);
+  if (cam === 'Mastcam_Z_cams') await page.screenshot({ path: 'check/screenshot-cameras.png' });
+  await page.mouse.click(bb.x + bb.width / 2, bb.y + bb.height / 2);
+  const ok = await page.waitForFunction(() => {
+    const i = document.getElementById('cam-img');
+    return i.complete && i.naturalWidth > 0 && i.classList.contains('dev');
+  }, null, { timeout: 30000 }).then(() => true, () => false);
+  const info = await page.evaluate(() => ({ meta: document.getElementById('cam-meta').innerText.split('\n')[0], w: document.getElementById('cam-img').naturalWidth }));
+  if (!ok) errors.push(`[check] cámara ${cam}: la foto no cargó`);
+  camResults.push(`[check] ${cam}: ${ok ? `foto ${info.w}px` : 'sin foto'} — ${info.meta}`);
+  if (cam === 'NavCams') {
+    await page.waitForTimeout(3000); // la foto termina de revelarse
+    await page.screenshot({ path: 'check/screenshot-photo.png' });
+  }
+  await page.keyboard.press('Escape');
+  if (await page.locator('#cam-view.open').count()) errors.push(`[check] cámara ${cam}: Esc no cerró la foto`);
+}
+camResults.forEach((l) => console.log(l));
 await browser.close();
 
 roverLogs.forEach((l) => console.log(l));
-console.log('Capturas: check/screenshot.png, check/screenshot-back.png (tras conducir y orbitar 180°), check/screenshot-climb.png (rueda sobre roca)');
+console.log('Capturas: check/screenshot.png, check/screenshot-back.png (tras conducir y orbitar 180°), check/screenshot-climb.png (rueda sobre roca), check/screenshot-cameras.png (puntos de cámara), check/screenshot-photo.png (foto real de la Navcam)');
 if (errors.length) {
   console.log(`Errores de consola (${errors.length}):`);
   errors.forEach((e) => console.log(' ', e));

@@ -8,6 +8,7 @@ import { mergeVertices, toCreasedNormals } from 'three/addons/utils/BufferGeomet
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 import { createDashboard } from './dashboard.js';
+import { setupCameras } from './cameras.js';
 
 // Icosaedro indexado (vértices compartidos) para normales suaves
 const smoothIco = (detail) => {
@@ -1024,12 +1025,15 @@ const dashTick = createDashboard(() => {
     'percy.odometro': rover.odo || 0,
   };
 });
+// --- cámaras de Percy: puntos brillantes que abren fotos reales de Marte ---
+const camSpots = setupCameras({ rover, camera, renderer, onOpenChange: () => keys.clear() });
 renderer.setAnimationLoop((ms) => {
   const dt = THREE.MathUtils.clamp((ms - last) / 1000 || 0, 0, 0.05);
   last = ms;
   update(dt, ms * 0.001);
   composer.render();
   dashTick();
+  camSpots();
 });
 // gancho de pruebas: avanza la simulación sin depender de los FPS (lo usa npm run check)
 let simT = 0;
