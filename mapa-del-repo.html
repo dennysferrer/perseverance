@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mapa de Open MCT</title>
+<style>
+:root{--bg:#f7f5f2;--card:#fff;--ink:#1d1d1f;--muted:#5f5f66;--line:#d9d4cc;--accent:#c1440e;--accent2:#2f6f8f;--code:#f0ece6}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#16161a;--card:#202027;--ink:#ecebe8;--muted:#a3a2a8;--line:#3a3a44;--accent:#ff7a45;--accent2:#6fb3d6;--code:#2a2a33}}
+:root[data-theme="dark"]{--bg:#16161a;--card:#202027;--ink:#ecebe8;--muted:#a3a2a8;--line:#3a3a44;--accent:#ff7a45;--accent2:#6fb3d6;--code:#2a2a33}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:17px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:860px;margin:0 auto;padding:40px 16px 80px}
+h1{font-size:2rem;line-height:1.2;margin:0 0 12px}
+h2{font-size:1.35rem;margin:48px 0 12px;border-bottom:2px solid var(--line);padding-bottom:6px}
+.lead{font-size:1.2rem;color:var(--ink);background:var(--card);border-left:4px solid var(--accent);padding:16px 20px;border-radius:8px}
+code{font:0.82em ui-monospace,Menlo,monospace;background:var(--code);padding:2px 6px;border-radius:4px;word-break:break-all}
+.muted{color:var(--muted)}
+.flow{display:flex;flex-direction:column;align-items:stretch;gap:0}
+.box{background:var(--card);border:1.5px solid var(--line);border-radius:10px;padding:12px 16px}
+.box b{display:block}
+.box.core{border-color:var(--accent2)}
+.box.percy{border-color:var(--accent);border-style:dashed}
+.arrow{text-align:center;color:var(--muted);font-size:1.3rem;line-height:1.6}
+.arrow small{font-size:.8rem;display:block;line-height:1}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media (max-width:600px){.row{grid-template-columns:1fr}}
+.tag{font-size:.75rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
+ol.pieces>li,ol.steps>li{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 16px;margin:10px 0}
+pre{background:var(--code);padding:12px;border-radius:8px;overflow-x:auto;font-size:.8rem}
+.legend span{display:inline-block;margin-right:14px;font-size:.9rem}
+.sw{display:inline-block;width:12px;height:12px;border-radius:3px;vertical-align:middle;margin-right:4px;border:2px solid}
+</style>
+</head>
+<body>
+<main>
+<p class="tag">Mapa del repositorio · nasa/openmct</p>
+<h1>Cómo llegan los datos de Percy a una pantalla de control</h1>
+
+<p class="lead"><b>Open MCT es como el tablero de un auto, pero para naves espaciales:</b> una página web donde la NASA arma pantallas con gráficas y tablas que muestran, en vivo, lo que le está pasando a una misión.</p>
+
+<h2>El diagrama: de dónde sale un dato y cómo llega a la gráfica</h2>
+<p class="legend muted"><span><i class="sw" style="border-color:var(--accent2)"></i>Núcleo de Open MCT</span><span><i class="sw" style="border-color:var(--line)"></i>Plugin (pieza enchufable)</span><span><i class="sw" style="border-color:var(--accent);border-style:dashed"></i>Lo que escribiremos para Percy</span></p>
+
+<div class="flow">
+  <div class="box core"><b>1. El cerebro: la app <code>openmct</code></b>Se crea una sola vez y reúne todas las herramientas. <code>openmct.js:35</code> · clase en <code>src/MCT.js:77</code></div>
+  <div class="arrow">↓<small>se le enchufan piezas</small></div>
+  <div class="box core"><b>2. El enchufe: <code>install</code></b>Un plugin es solo una función que recibe la app. <code>src/MCT.js:435</code></div>
+  <div class="arrow">↓</div>
+  <div class="row">
+    <div class="box percy"><b>3a. El "catálogo" de Percy (tipo + campos)</b>Declara qué es un objeto de telemetría y qué valores trae (hora, temperatura…). Ejemplo: <code>example/generator/plugin.js:64</code> y <code>GeneratorMetadataProvider.js:73</code></div>
+    <div class="box percy"><b>3b. El "cartero" de Percy (proveedor)</b>Sabe pedir datos viejos y escuchar datos nuevos. Ejemplo: <code>example/generator/GeneratorProvider.js:46</code></div>
+  </div>
+  <div class="arrow">↓<small>se registra en</small></div>
+  <div class="box core"><b>4. La central de telemetría</b><code>addProvider</code> guarda al cartero en la lista correcta: <code>src/api/telemetry/TelemetryAPI.js:167</code>. Pedir historia: <code>:470</code>. Suscribirse en vivo: <code>:529</code>.</div>
+  <div class="arrow">↓<small>traduce cada valor a número/texto</small></div>
+  <div class="box core"><b>5. El traductor de valores</b>Toma un dato crudo y lo convierte en número para dibujar o texto para leer. <code>src/api/telemetry/TelemetryValueFormatter.js:115</code></div>
+  <div class="arrow">↓</div>
+  <div class="box"><b>6. La gráfica pide los datos</b>Pide historia: <code>src/plugins/plot/configuration/PlotSeries.js:228</code>. Y se suscribe para recibir lo nuevo: <code>PlotSeries.js:214</code></div>
+  <div class="arrow">↓<small>cada punto entra en orden</small></div>
+  <div class="box"><b>7. La lista de puntos</b>Inserta el punto ordenado por hora y avisa “llegó uno nuevo”. <code>PlotSeries.js:436</code> · aviso en <code>:471</code></div>
+  <div class="arrow">↓</div>
+  <div class="box"><b>8. El dibujo en pantalla</b>Programa un redibujado <code>src/plugins/plot/chart/MctChart.vue:758</code> y traza la línea con la tarjeta gráfica <code>src/plugins/plot/draw/DrawWebGL.js:251</code></div>
+</div>
+
+<h2>Las 5 piezas clave para conectar Percy</h2>
+<ol class="pieces">
+  <li><b>Un plugin propio</b> — una función <code>install(openmct)</code> que agrupa todo lo de Percy. Se enchufa igual que los demás (<code>src/MCT.js:435</code>; ejemplo de uso en <code>index.html:104</code>).</li>
+  <li><b>Un tipo de objeto</b> — “Sensor de Percy”, registrado con <code>openmct.types.addType</code> (<code>src/api/types/TypeRegistry.js:59</code>).</li>
+  <li><b>Un proveedor de objetos y una carpeta raíz</b> — para que aparezca “Perseverance” en el árbol de la izquierda con sus sensores (<code>src/api/objects/ObjectAPI.js:168</code> y <code>:498</code>).</li>
+  <li><b>Los metadatos</b> — la lista de campos de cada dato: hora (eje X) y valor (eje Y). Modelo: <code>example/generator/GeneratorMetadataProvider.js:73</code>.</li>
+  <li><b>El proveedor de telemetría</b> — con <code>request</code> (historia) y <code>subscribe</code> (en vivo), registrado en <code>src/api/telemetry/TelemetryAPI.js:167</code>. Modelo: <code>example/generator/GeneratorProvider.js:91</code> y <code>:101</code>.</li>
+</ol>
+<p class="muted">La gráfica, las tablas y el reloj ya vienen incluidos (<code>src/MCT.js:285–286</code>): no hay que construirlos.</p>
+
+<h2>Cómo conectamos Percy</h2>
+<ol class="steps">
+  <li><b>Decidir la fuente de datos.</b> Nuestra simulación de Marte (este proyecto, Three.js) ya “sabe” velocidad, posición, inclinación y batería del rover. Esa será la fuente.</li>
+  <li><b>Hacer que la simulación hable.</b> Que publique cada lectura, por ejemplo por un WebSocket, como <code>{ "id": "percy.velocidad", "utc": 1763300000000, "value": 0.04 }</code>.</li>
+  <li><b>Crear el plugin <code>PercyPlugin</code></b> con las piezas 2 a 5:
+<pre>openmct.types.addType('percy.sensor', { name: 'Sensor de Percy' });
+openmct.objects.addRoot({ namespace: 'percy', key: 'rover' });
+openmct.objects.addProvider('percy', proveedorDeObjetos);
+openmct.telemetry.addProvider({
+  supportsRequest:   o =&gt; o.type === 'percy.sensor',
+  request:           (o, opts) =&gt; historial(o, opts.start, opts.end),
+  supportsSubscribe: o =&gt; o.type === 'percy.sensor',
+  subscribe:         (o, avisar) =&gt; escucharWebSocket(o, avisar)
+});</pre>
+  Cada sensor declara sus campos: <code>utc</code> (hora, eje X) y <code>value</code> (eje Y).</li>
+  <li><b>Enchufarlo</b> en la página de Open MCT: <code>openmct.install(PercyPlugin())</code>, antes de <code>openmct.start()</code> (<code>index.html:240</code>).</li>
+  <li><b>Armar la pantalla.</b> En el árbol aparece “Perseverance”; al hacer clic en un sensor ya se ve su gráfica en vivo. Se pueden juntar varias en una gráfica apilada o en una tabla de “último valor” (LAD).</li>
+</ol>
+
+<h2>Commit analizado</h2>
+<p><code>e09bfaf47856b2b7ae2ea74334800b26fd27a41e</code> · 6 de octubre de 2026 · “[Documentation] Add AGENTS.md contributor guidance (#8379)”. Solo leímos el repositorio: no se instaló ni se modificó nada.</p>
+</main>
+</body>
+</html>

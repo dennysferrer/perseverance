@@ -7,6 +7,7 @@ import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { mergeVertices, toCreasedNormals } from 'three/addons/utils/BufferGeometryUtils.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+import { createDashboard } from './dashboard.js';
 
 // Icosaedro indexado (vértices compartidos) para normales suaves
 const smoothIco = (detail) => {
@@ -653,17 +654,20 @@ function setupRig(model, holder) {
     });
     // eje de la rueda: centro horizontal de la rueda, a un radio del suelo
     const axle = new THREE.Vector3((box.min.x + box.max.x) / 2, box.min.y + R, (box.min.z + box.max.z) / 2);
+    // wrapper (sube/baja y gira la dirección en Y) → spinner (rueda sobre su eje X)
     const wrapper = new THREE.Group();
+    const spinner = new THREE.Group();
+    wrapper.add(spinner);
     geos.forEach((g, pi) => {
       if (!g) return;
       g.translate(-axle.x, -axle.y, -axle.z);
       const m = new THREE.Mesh(g, parts[pi].mat);
       m.castShadow = m.receiveShadow = true;
-      wrapper.add(m);
+      spinner.add(m);
     });
     wrapper.position.copy(axle);
     holder.add(wrapper);
-    return { wrapper, base: axle.clone(), x: axle.x, f: -axle.z, side: c.side, off: 0, spin: 0, contact: 0 };
+    return { wrapper, spinner, base: axle.clone(), x: axle.x, f: -axle.z, side: c.side, off: 0, spin: 0, steer: 0, contact: 0 };
   });
   rover.trackHalf = rover.wheels.reduce((s, w) => s + Math.abs(w.x), 0) / rover.wheels.length;
 
@@ -888,6 +892,7 @@ function update(dt, t) {
   right.set(Math.cos(rover.heading), 0, -Math.sin(rover.heading));
   rover.x += fwd.x * rover.speed * dt;
   rover.z += fwd.z * rover.speed * dt;
+  rover.odo = (rover.odo || 0) + Math.abs(rover.speed) * dt;
   // choque con rocas grandes: el rover se detiene y se desliza por el borde
   for (const b of boulders) {
     const dx = rover.x - b.x, dz = rover.z - b.z, minD = b.r + 1.35;
@@ -935,10 +940,24 @@ function update(dt, t) {
     rover.pivot.localToWorld(wp);
     const target = THREE.MathUtils.clamp(w.contact - wp.y, -0.25, 0.45);
     w.off += (target - w.off) * (1 - Math.exp(-dt * 25));
-    w.spin += ((rover.speed + yawRate * w.x) * dt) / (WHEEL_DIAMETER / 2);
+    // velocidad del suelo bajo la rueda (avance + giro del chasis): lateral y hacia delante
+    const lat = -yawRate * w.f, fw = rover.speed + yawRate * w.x;
+    let roll = fw;
+    // las 4 ruedas de las esquinas tienen dirección (como Perseverance): se orientan
+    // según la velocidad local; las del medio van fijas. Ángulo limitado a ±90°.
+    if (Math.abs(w.f) > 0.3 && Math.hypot(lat, fw) > 0.02) {
+      let phi = Math.atan2(-lat, fw);
+      roll = Math.hypot(lat, fw);
+      if (phi > Math.PI / 2) { phi -= Math.PI; roll = -roll; } else if (phi < -Math.PI / 2) { phi += Math.PI; roll = -roll; }
+      w.steer += (phi - w.steer) * (1 - Math.exp(-dt * 6)); // el actuador tarda un poco
+    } else if (Math.abs(w.f) > 0.3 && Math.abs(throttle) + Math.abs(steer) === 0) {
+      w.steer *= Math.exp(-dt * 1.5); // en reposo vuelve poco a poco al centro
+    }
+    w.spin += (roll * dt) / (WHEEL_DIAMETER / 2);
     if (w.wrapper) {
       w.wrapper.position.y = w.base.y + w.off;
-      w.wrapper.rotation.x = -w.spin;
+      w.wrapper.rotation.y = w.steer;
+      w.spinner.rotation.x = -w.spin;
     }
   }
   deformSuspension();
@@ -991,11 +1010,26 @@ function update(dt, t) {
 
   grade.uniforms.time.value = t;
 }
+// --- dashboard de telemetría (modelo Open MCT) ---
+const attEuler = new THREE.Euler();
+const dashTick = createDashboard(() => {
+  attEuler.setFromQuaternion(rover.pivot.quaternion, 'YXZ');
+  const deg = THREE.MathUtils.radToDeg;
+  return {
+    'percy.velocidad': Math.abs(rover.speed),
+    'percy.rumbo': (deg(-rover.heading) % 360 + 360) % 360,
+    'percy.cabeceo': deg(attEuler.x),
+    'percy.alabeo': deg(attEuler.z),
+    'percy.altitud': rover.pivot.position.y,
+    'percy.odometro': rover.odo || 0,
+  };
+});
 renderer.setAnimationLoop((ms) => {
   const dt = THREE.MathUtils.clamp((ms - last) / 1000 || 0, 0, 0.05);
   last = ms;
   update(dt, ms * 0.001);
   composer.render();
+  dashTick();
 });
 // gancho de pruebas: avanza la simulación sin depender de los FPS (lo usa npm run check)
 let simT = 0;
